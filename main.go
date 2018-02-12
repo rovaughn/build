@@ -82,12 +82,45 @@ type execCommand struct {
 	command string
 }
 
+type execServer struct {
+	cmd     *exec.Cmd
+	dir     string
+	sources []string
+}
+
 func (c *execCommand) run(dir string) error {
+	log.Println("run", c.command)
 	cmd := exec.Command("sh", "-c", c.command)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	cmd.Dir = dir
 	return cmd.Run()
+}
+
+func (c *execCommand) serve(dir string, sources []string) (server, error) {
+	cmd := exec.Command("sh", "-c", c.command)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	cmd.Dir = dir
+
+	go func() {
+		if err := cmd.Run(); err != nil {
+			log.Println(err)
+		}
+	}()
+
+	return &execServer{
+		cmd:     cmd,
+		dir:     dir,
+		sources: sources,
+	}, nil
+}
+
+func (s *execServer) listSources() []string {
+	return s.sources
+}
+
+func (s *execServer) kill() {
 }
 
 type serveHTTPCommand struct {
@@ -323,14 +356,8 @@ func build(artifact string) (*buildResult, error) {
 			return nil, err
 		}
 
-		// TODO is this necessary?  Might be necessary for directories.
-		now := time.Now()
-		if err := os.Chtimes(artifact, now, now); err != nil {
-			return nil, err
-		}
-
 		return &buildResult{
-			modTime: now,
+			modTime: time.Now(),
 			sources: sources,
 		}, nil
 	})
@@ -377,6 +404,7 @@ func main() {
 
 	var group errgroup.Group
 	for _, artifact := range artifacts {
+		artifact := artifact
 		group.Go(func() error {
 			if strings.HasPrefix(artifact, "serve-") {
 				server, err := serve(artifact)
