@@ -90,6 +90,12 @@ Here are some examples of what the command line could look like:
 	# restarted/rebuilt if their sources change.
 	$ build serve-api serve-dist
 
+## Installation ##
+
+If you have go installed, you should just be able to do
+
+	go get github.com/rovaughn/build
+
 ## TODO ##
 
 - When depending on a directory, consider the modtimes of all files in the
