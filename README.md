@@ -4,13 +4,14 @@ build
 `build` is a pretty simple build tool meant to be an upgrade to make.  It
 focuses on correcting the following deficiencies I have run into with make:
 
-- If a build recipe fails halfway through, a partially made and incorrect
+- If a make recipe fails halfway through, a partially made and incorrect
   artifact will still be produced.  Now make will think the artifact was made
   correctly and not rebuild it.
-- If the build configuration (i.e. Makefile) changes, targets won't be remade
-  using the new recipes.
+- If the recipe for an artifact in the Makefile changes, the target won't be
+  remade using the new recipe.
 - Inputs/outputs of recipes are relatively ad hoc.  You can forget a dependency
-  or, and a recipe can produce more artifacts than it intended to.
+  or, and a recipe can produce more artifacts than it intended to, or have
+  other unintended effects.
 - Parallelism must be manually enabled.  This may be due to Make's lack of
   isolation in build steps.
 - A cleaning recipe must be manually written, even though make knows what
@@ -20,7 +21,7 @@ focuses on correcting the following deficiencies I have run into with make:
 - No support for running long running processes from artifacts, e.g. an HTTP
   server, that automatically restarts when dependencies change.
 
-Here is what the build configuration looks like, stored in a file called
+Here is what an example build configuration looks like, stored in a file called
 `build.yml`:
 
 	index.css:
@@ -90,6 +91,9 @@ Here are some examples of what the command line could look like:
 
 ## TODO ##
 
+- Automatic recipes based on file extension.  For instance a recipe named
+  something like `default.c` would run for any `.c` file that didn't have an
+  explicit recipe.
 - Recognize build.yml itself as a dependency.  This will be quick to add.
 - There are places where error messages could be more clear.
 - If multiple commands are running in parallel and emitting output at the same
