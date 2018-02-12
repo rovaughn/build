@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"flag"
 	"fmt"
+	"github.com/fsnotify/fsnotify"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 	"gopkg.in/yaml.v2"
@@ -70,11 +71,13 @@ func interpretCommand(command string) interface{} {
 type buildResult struct {
 	artifactPath string
 	modTime      time.Time
+	dependencies []string
 }
 
 func build(artifact string) (*buildResult, error) {
 	result, err, _ := flightGroup.Do(artifact, func() (interface{}, error) {
 		artifactKey := makeArtifactKey(artifact)
+		sourceDependencies := make([]string, 0)
 
 		recipe, ok := config[artifact]
 		if ok {
@@ -116,6 +119,7 @@ func build(artifact string) (*buildResult, error) {
 						dependenciesLock.Lock()
 						defer dependenciesLock.Unlock()
 						dependencies[artifact] = buildResult.artifactPath
+						sourceDependencies = append(sourceDependencies, buildResult.dependencies...)
 
 						return nil
 					})
@@ -129,6 +133,7 @@ func build(artifact string) (*buildResult, error) {
 				return &buildResult{
 					artifactPath: artifactPath,
 					modTime:      lastBuildTime,
+					dependencies: sourceDependencies,
 				}, nil
 			}
 
@@ -216,6 +221,7 @@ func build(artifact string) (*buildResult, error) {
 			return &buildResult{
 				artifactPath: artifactPath,
 				modTime:      now,
+				dependencies: sourceDependencies,
 			}, nil
 		}
 
@@ -223,6 +229,7 @@ func build(artifact string) (*buildResult, error) {
 			return &buildResult{
 				artifactPath: artifact,
 				modTime:      stat.ModTime(),
+				dependencies: []string{artifact},
 			}, nil
 		}
 
@@ -236,7 +243,26 @@ func build(artifact string) (*buildResult, error) {
 	}
 }
 
+func buildTarget(artifact string) (*buildResult, error) {
+	buildResult, err := build(artifact)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := os.Remove(artifact); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	if err := os.Symlink(buildResult.artifactPath, artifact); err != nil {
+		return nil, err
+	}
+
+	return buildResult, nil
+}
+
 func main() {
+	var watching bool
+	flag.BoolVar(&watching, "watch", false, "Keep watching and rebuilding artifact when changes are made.")
 	flag.Parse()
 
 	if err := os.Mkdir(".build", 0700); err != nil && !os.IsExist(err) {
@@ -252,22 +278,59 @@ func main() {
 		panic(err)
 	}
 
+	sources := make([]string, 0)
+
 	for _, artifact := range flag.Args() {
 		if _, ok := config[artifact]; !ok {
 			panic(fmt.Sprintf("%q isn't a recipe", artifact))
 		}
 
-		buildResult, err := build(artifact)
+		buildResult, err := buildTarget(artifact)
 		if err != nil {
 			panic(err)
 		}
 
-		if err := os.Remove(artifact); err != nil && !os.IsNotExist(err) {
+		sources = append(sources, buildResult.dependencies...)
+	}
+
+	if watching {
+		watcher, err := fsnotify.NewWatcher()
+		if err != nil {
 			panic(err)
 		}
+		defer watcher.Close()
 
-		if err := os.Symlink(buildResult.artifactPath, artifact); err != nil {
-			panic(err)
+		log.Printf("Watching %v", sources)
+
+		for _, source := range sources {
+			if err := watcher.Add(source); err != nil {
+				panic(err)
+			}
+		}
+
+		for {
+			log.Printf("Watching for changes...")
+			select {
+			case event := <-watcher.Events:
+				if event.Op&fsnotify.Rename != 0 {
+					if err := watcher.Add(event.Name); err != nil {
+						panic(err)
+					}
+				}
+
+				if event.Op&(fsnotify.Write|fsnotify.Rename) != 0 {
+					log.Printf("%q changed, rebuilding...", event.Name)
+					for _, artifact := range flag.Args() {
+						_, err := buildTarget(artifact)
+						if err != nil {
+							panic(err)
+						}
+					}
+					log.Printf("Done rebuilding")
+				}
+			case err := <-watcher.Errors:
+				log.Printf("watcher: %s", err)
+			}
 		}
 	}
 }
