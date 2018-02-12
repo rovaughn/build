@@ -7,6 +7,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 	"gopkg.in/yaml.v2"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
@@ -27,6 +28,7 @@ type command interface {
 type includeCommand struct {
 	artifacts []string
 	into      string
+	copy      bool
 }
 
 func (c *includeCommand) run(dir string) error {
@@ -36,8 +38,26 @@ func (c *includeCommand) run(dir string) error {
 			return err
 		}
 
-		if err := os.Symlink(artifactPath, filepath.Join(dir, c.into, artifact)); err != nil {
-			return err
+		if c.copy {
+			fin, err := os.Open(artifactPath)
+			if err != nil {
+				return err
+			}
+			defer fin.Close()
+
+			fout, err := os.Create(filepath.Join(dir, c.into, artifact))
+			if err != nil {
+				return err
+			}
+			defer fout.Close()
+
+			if _, err := io.Copy(fout, fin); err != nil {
+				return err
+			}
+		} else {
+			if err := os.Symlink(artifactPath, filepath.Join(dir, c.into, artifact)); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -63,10 +83,13 @@ func parseCommand(command string) command {
 		cmd := includeCommand{
 			artifacts: nil,
 			into:      ".",
+			copy:      false,
 		}
 
 		for i := 1; i < len(words); i++ {
-			if words[i] == "-into" {
+			if words[i] == "-copy" {
+				cmd.copy = true
+			} else if words[i] == "-into" {
 				i++
 				cmd.into = words[i]
 			} else {
