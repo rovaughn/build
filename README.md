@@ -107,3 +107,5 @@ If you have go installed, you should just be able to do
 - There are places where error messages could be more clear.
 - If multiple commands are running in parallel and emitting output at the same
   time, it would get confusing.
+- "Dynamic includes," where an include depends on the contents of a file (e.g.
+  you scan a file to determine its dependencies) may be worth consideration.
