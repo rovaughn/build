@@ -98,14 +98,16 @@ If you have go installed, you should just be able to do
 
 ## TODO ##
 
+- Recognize build.yml itself as a dependency.  This will be quick to add.
+- There are places where error messages could be more clear.
 - When depending on a directory, consider the modtimes of all files in the
   directory.
 - Automatic recipes based on file extension.  For instance a recipe named
   something like `default.c` would run for any `.c` file that didn't have an
   explicit recipe.
-- Recognize build.yml itself as a dependency.  This will be quick to add.
-- There are places where error messages could be more clear.
 - If multiple commands are running in parallel and emitting output at the same
   time, it would get confusing.
-- "Dynamic includes," where an include depends on the contents of a file (e.g.
-  you scan a file to determine its dependencies) may be worth consideration.
+- It might be useful to have a "refine" command.  For instance when gcc
+  compiles something, it can tell you exactly what source files it ended up
+  using.  You could refine an include so it actually only depends on the files
+  that were actually used.
