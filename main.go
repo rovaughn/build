@@ -171,8 +171,6 @@ func build(artifact string) (*buildResult, error) {
 		}
 		defer os.RemoveAll(buildDir)
 
-		outputPath := filepath.Join(buildDir, "result")
-
 		for _, command := range recipe {
 			if err := parseCommand(command).run(buildDir); err != nil {
 				return nil, err
@@ -183,7 +181,7 @@ func build(artifact string) (*buildResult, error) {
 			return nil, err
 		}
 
-		if err := os.Rename(outputPath, artifact); err != nil {
+		if err := os.Rename(filepath.Join(buildDir, filepath.Base(artifact)), artifact); err != nil {
 			return nil, err
 		}
 
