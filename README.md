@@ -60,17 +60,17 @@ uses the include commands to determine the recipe's dependencies, and since the
 recipe can only see files it explicitly includes, you can't forget to
 explicitly mention a dependency.
 
-The recipe's output is determined by whatever file is left in the build
-directory with the artifact's name.  For instance, the recipe for index.css
-produces the file index.css.  If the recipe succeeds, this file will be
-atomically moved to the real artifact.  If the recipe fails, no artifact will
-be produced at all.  An artifact can be a file or directory.
+A recipe's output is determined by whatever file is left in the build directory
+with the artifact's name.  For instance, the recipe for index.css produces the
+file index.css.  If the recipe succeeds, this file will be atomically moved to
+the real artifact.  If the recipe fails, no artifact will be produced at all.
+An artifact can be a file or directory.
 
-Recipe targets prefixed with `serve-` are special serving recipes.  They expect
-their last command to be a long running command, like a webserver.  It can
-either be a typical shell command or the built in serve-http command.  A server
-recipe will automatically restart and rebuild when changes are made to any of
-its sources.
+Recipes with names starting with `serve-` are special serving recipes.  They
+expect their last command to be a long running command, like a webserver.  It
+can either be a typical shell command or the built in serve-http command.  A
+server recipe will automatically restart and rebuild when changes are made to
+any of its sources.
 
 Here are some examples of what the command line could look like:
 
