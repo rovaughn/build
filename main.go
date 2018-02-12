@@ -12,11 +12,36 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
+
+type cleanupListType struct {
+	lock    sync.Mutex
+	once    sync.Once
+	actions []func()
+}
+
+func (c *cleanupListType) add(f func()) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	c.actions = append(c.actions, f)
+}
+
+func (c *cleanupListType) clean() {
+	c.once.Do(func() {
+		for _, f := range c.actions {
+			f()
+		}
+	})
+}
+
+var cleanupList cleanupListType
 
 var flightGroup singleflight.Group
 var config map[string][]string
@@ -33,16 +58,101 @@ func makeArtifactKey(artifact string) string {
 	return fmt.Sprintf("%s-%x", humanTag, hash[:8])
 }
 
+type commandEnvironment struct {
+	buildDir     string
+	outputPath   string
+	dependencies map[string]string
+}
+
 type includeCommand struct {
 	artifacts []string
 	into      string
+}
+
+func (c *includeCommand) run(e commandEnvironment) error {
+	absOutputPath, err := filepath.Abs(e.outputPath)
+	if err != nil {
+		return err
+	}
+
+	into := os.Expand(c.into, func(name string) string {
+		if name == "OUT" {
+			return absOutputPath
+		} else {
+			return "$" + name
+		}
+	})
+
+	for _, artifact := range c.artifacts {
+		dependencyPath, ok := e.dependencies[artifact]
+		if !ok {
+			panic("impossible")
+		}
+
+		var intoPath string
+		if filepath.IsAbs(into) {
+			intoPath = filepath.Join(into, artifact)
+		} else {
+			intoPath = filepath.Join(e.buildDir, into, artifact)
+		}
+
+		absDependecyPath, err := filepath.Abs(dependencyPath)
+		if err != nil {
+			return err
+		}
+
+		if err := os.Symlink(absDependecyPath, intoPath); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 type execCommand struct {
 	command string
 }
 
-func interpretCommand(command string) interface{} {
+func (c *execCommand) run(e commandEnvironment) error {
+	absOutputPath, err := filepath.Abs(e.outputPath)
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.Command("sh", "-c", c.command)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	cmd.Dir = e.buildDir
+	cmd.Env = append(cmd.Env, os.Environ()...)
+	cmd.Env = append(cmd.Env, "OUT="+absOutputPath)
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *execCommand) runServer(dir string) (*server, error) {
+	cmd := exec.Command("sh", "-c", c.command)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	cmd.Dir = dir
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	return &server{
+		cmd: cmd,
+		dir: dir,
+	}, nil
+}
+
+type command interface {
+	run(commandEnvironment) error
+}
+
+func interpretCommand(command string) command {
 	words := strings.Fields(command)
 
 	if words[0] == "include" {
@@ -74,7 +184,100 @@ type buildResult struct {
 	dependencies []string
 }
 
+type server struct {
+	dependencies []string
+	dir          string
+	cmd          *exec.Cmd
+}
+
+func (s *server) kill() error {
+	syscall.Kill(-s.cmd.Process.Pid, syscall.SIGINT)
+
+	if err := os.RemoveAll(s.dir); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func serveTarget(artifact string) (*server, error) {
+	if !strings.HasPrefix(artifact, "serve-") {
+		return nil, fmt.Errorf("can't serve %q; it's not a serve- target", artifact)
+	}
+
+	artifactKey := makeArtifactKey(artifact)
+	sourceDependencies := make([]string, 0)
+
+	recipe, ok := config[artifact]
+	if !ok {
+		return nil, fmt.Errorf("No recipe for %q", artifact)
+	}
+
+	var dependenciesLock sync.Mutex
+	dependencies := make(map[string]string)
+
+	var group errgroup.Group
+	for _, command := range recipe {
+		include, ok := interpretCommand(command).(*includeCommand)
+		if !ok {
+			continue
+		}
+
+		for _, artifact := range include.artifacts {
+			artifact := artifact
+			group.Go(func() error {
+				buildResult, err := build(artifact)
+				if err != nil {
+					return fmt.Errorf("building %s: %s", artifact, err)
+				}
+
+				dependenciesLock.Lock()
+				defer dependenciesLock.Unlock()
+				dependencies[artifact] = buildResult.artifactPath
+				sourceDependencies = append(sourceDependencies, buildResult.dependencies...)
+
+				return nil
+			})
+		}
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+
+	serveDir := filepath.Join(".build", artifactKey)
+	if err := os.Mkdir(serveDir, 0700); err != nil {
+		return nil, fmt.Errorf("Creating serving directory for %s: %s", artifact, err)
+	}
+
+	for _, command := range recipe[:len(recipe)-1] {
+		if err := interpretCommand(command).run(commandEnvironment{
+			buildDir:     serveDir,
+			dependencies: dependencies,
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	command, ok := interpretCommand(recipe[len(recipe)-1]).(*execCommand)
+	if !ok {
+		return nil, fmt.Errorf("Last command of serve target must be an executable command")
+	}
+
+	server, err := command.runServer(serveDir)
+	if err != nil {
+		return nil, err
+	}
+
+	server.dependencies = sourceDependencies
+
+	return server, nil
+}
+
 func build(artifact string) (*buildResult, error) {
+	if strings.HasPrefix(artifact, "serve-") {
+		return nil, fmt.Errorf("Cannot build %q as an artifact")
+	}
+
 	result, err, _ := flightGroup.Do(artifact, func() (interface{}, error) {
 		artifactKey := makeArtifactKey(artifact)
 		sourceDependencies := make([]string, 0)
@@ -97,13 +300,13 @@ func build(artifact string) (*buildResult, error) {
 			var dependenciesLock sync.Mutex
 			dependencies := make(map[string]string)
 
+			var group errgroup.Group
 			for _, command := range recipe {
 				include, ok := interpretCommand(command).(*includeCommand)
 				if !ok {
 					continue
 				}
 
-				var group errgroup.Group
 				for _, artifact := range include.artifacts {
 					artifact := artifact
 					group.Go(func() error {
@@ -124,9 +327,9 @@ func build(artifact string) (*buildResult, error) {
 						return nil
 					})
 				}
-				if err := group.Wait(); err != nil {
-					return nil, err
-				}
+			}
+			if err := group.Wait(); err != nil {
+				return nil, err
 			}
 
 			if !needsBuild {
@@ -141,67 +344,25 @@ func build(artifact string) (*buildResult, error) {
 			if err := os.Mkdir(buildDir, 0700); err != nil {
 				return nil, err
 			}
+			cleanupList.add(func() {
+				os.RemoveAll(buildDir)
+			})
 			defer os.RemoveAll(buildDir)
 
 			outputPath := filepath.Join(".build", "artifact-output-"+artifactKey)
+			cleanupList.add(func() {
+				os.RemoveAll(outputPath)
+			})
 			defer os.RemoveAll(outputPath)
-
-			absOutputPath, err := filepath.Abs(outputPath)
-			if err != nil {
-				return nil, err
-			}
 
 			for _, command := range recipe {
 				log.Printf("Executing %q", command)
-				switch command := interpretCommand(command).(type) {
-				case *includeCommand:
-					command.into = os.Expand(command.into, func(name string) string {
-						if name == "OUT" {
-							return absOutputPath
-						} else {
-							return "$" + name
-						}
-					})
-
-					for _, artifact := range command.artifacts {
-						dependencyPath, ok := dependencies[artifact]
-						if !ok {
-							panic("impossible")
-						}
-
-						var intoPath string
-						if filepath.IsAbs(command.into) {
-							intoPath = filepath.Join(command.into, artifact)
-						} else {
-							intoPath = filepath.Join(buildDir, command.into, artifact)
-						}
-
-						absDependecyPath, err := filepath.Abs(dependencyPath)
-						if err != nil {
-							return nil, err
-						}
-
-						if err := os.Symlink(absDependecyPath, intoPath); err != nil {
-							return nil, err
-						}
-					}
-				case *execCommand:
-					absOutputPath, err := filepath.Abs(outputPath)
-					if err != nil {
-						return nil, err
-					}
-
-					cmd := exec.Command("sh", "-c", command.command)
-					cmd.Stdout = os.Stderr
-					cmd.Stderr = os.Stderr
-					cmd.Dir = buildDir
-					cmd.Env = append(cmd.Env, os.Environ()...)
-					cmd.Env = append(cmd.Env, "OUT="+absOutputPath)
-					if err := cmd.Run(); err != nil {
-						return nil, err
-					}
-				default:
-					panic("impossible")
+				if err := interpretCommand(command).run(commandEnvironment{
+					buildDir:     buildDir,
+					outputPath:   outputPath,
+					dependencies: dependencies,
+				}); err != nil {
+					return nil, err
 				}
 			}
 
@@ -236,31 +397,36 @@ func build(artifact string) (*buildResult, error) {
 		return nil, fmt.Errorf("Don't know how to build %q", artifact)
 	})
 
-	if err != nil {
+	if result == nil {
 		return nil, err
 	} else {
-		return result.(*buildResult), nil
+		return result.(*buildResult), err
 	}
 }
 
-func buildTarget(artifact string) (*buildResult, error) {
-	buildResult, err := build(artifact)
-	if err != nil {
-		return nil, err
-	}
+func buildTarget(artifact string) (interface{}, error) {
+	if strings.HasPrefix(artifact, "serve-") {
+		return serveTarget(artifact)
+	} else {
+		result, err := build(artifact)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.Remove(artifact); err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
 
-	if err := os.Remove(artifact); err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
+		if err := os.Symlink(result.artifactPath, artifact); err != nil {
+			return nil, err
+		}
 
-	if err := os.Symlink(buildResult.artifactPath, artifact); err != nil {
-		return nil, err
+		return result, nil
 	}
-
-	return buildResult, nil
 }
 
 func main() {
+	defer cleanupList.clean()
+
 	var watching bool
 	flag.BoolVar(&watching, "watch", false, "Keep watching and rebuilding artifact when changes are made.")
 	flag.Parse()
@@ -278,22 +444,48 @@ func main() {
 		panic(err)
 	}
 
+	if len(flag.Args()) == 0 {
+		panic("no targets")
+	}
+
 	sources := make([]string, 0)
+	servers := make([]*server, 0)
+	cleanupList.add(func() {
+		for _, server := range servers {
+			server.kill()
+		}
+	})
+
+	sigint := make(chan os.Signal)
+	signal.Notify(sigint, os.Interrupt)
+	go func() {
+		<-sigint
+		cleanupList.clean()
+		os.Exit(0)
+	}()
 
 	for _, artifact := range flag.Args() {
 		if _, ok := config[artifact]; !ok {
 			panic(fmt.Sprintf("%q isn't a recipe", artifact))
 		}
 
-		buildResult, err := buildTarget(artifact)
+		result, err := buildTarget(artifact)
 		if err != nil {
 			panic(err)
 		}
 
-		sources = append(sources, buildResult.dependencies...)
+		switch result := result.(type) {
+		case *buildResult:
+			sources = append(sources, result.dependencies...)
+		case *server:
+			sources = append(sources, result.dependencies...)
+			servers = append(servers, result)
+		default:
+			panic("impossible")
+		}
 	}
 
-	if watching {
+	if watching || len(servers) > 0 {
 		watcher, err := fsnotify.NewWatcher()
 		if err != nil {
 			panic(err)
@@ -320,10 +512,29 @@ func main() {
 
 				if event.Op&(fsnotify.Write|fsnotify.Rename) != 0 {
 					log.Printf("%q changed, rebuilding...", event.Name)
+					for _, server := range servers {
+						log.Printf("Killing server %d...", server.cmd.Process.Pid)
+						if err := server.kill(); err != nil {
+							panic(err)
+						}
+					}
+
+					servers = servers[:0]
+
 					for _, artifact := range flag.Args() {
-						_, err := buildTarget(artifact)
+						result, err := buildTarget(artifact)
 						if err != nil {
 							panic(err)
+						}
+
+						switch result := result.(type) {
+						case *buildResult:
+							sources = append(sources, result.dependencies...)
+						case *server:
+							sources = append(sources, result.dependencies...)
+							servers = append(servers, result)
+						default:
+							panic("impossible")
 						}
 					}
 					log.Printf("Done rebuilding")
