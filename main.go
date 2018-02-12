@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,19 @@ import (
 var recipes map[string][]string
 
 type command interface {
+	run(dir string) error
+}
+
+type server interface {
+	listSources() []string
+	kill()
+}
+
+type serveCommand interface {
+	serve(dir string, sources []string) (server, error)
+}
+
+type runCommand interface {
 	run(dir string) error
 }
 
@@ -76,7 +90,52 @@ func (c *execCommand) run(dir string) error {
 	return cmd.Run()
 }
 
-func parseCommand(command string) command {
+type serveHTTPCommand struct {
+	dir  string
+	addr string
+}
+
+type httpServer struct {
+	server  *http.Server
+	dir     string
+	sources []string
+}
+
+func (s *httpServer) listSources() []string {
+	return s.sources
+}
+
+func (s *httpServer) kill() {
+	os.RemoveAll(s.dir)
+	s.server.Close()
+}
+
+func (c *serveHTTPCommand) serve(dir string, sources []string) (server, error) {
+	webroot, err := filepath.EvalSymlinks(filepath.Join(dir, c.dir))
+	if err != nil {
+		return nil, err
+	}
+
+	server := &http.Server{
+		Addr:    c.addr,
+		Handler: http.FileServer(http.Dir(webroot)),
+	}
+
+	go func() {
+		log.Printf("Serving %s on %s", webroot, c.addr)
+		if err := server.ListenAndServe(); err != nil {
+			log.Print(err)
+		}
+	}()
+
+	return &httpServer{
+		server:  server,
+		dir:     dir,
+		sources: sources,
+	}, nil
+}
+
+func parseCommand(command string) interface{} {
 	words := strings.Fields(command)
 
 	if words[0] == "include" {
@@ -100,16 +159,72 @@ func parseCommand(command string) command {
 		return &cmd
 	}
 
-	//if words[0] == "serve-http" {
-	//	return &httpCommand{
-	//		dir:  words[1],
-	//		addr: words[2],
-	//	}
-	//}
+	if words[0] == "serve-http" {
+		return &serveHTTPCommand{
+			dir:  words[1],
+			addr: words[2],
+		}
+	}
 
 	return &execCommand{
 		command: command,
 	}
+}
+
+func serve(artifact string) (server, error) {
+	if !strings.HasPrefix(artifact, "serve-") {
+		return nil, fmt.Errorf("Cannot serve recipe %q", artifact)
+	}
+
+	recipe, ok := recipes[artifact]
+	if !ok {
+		return nil, fmt.Errorf("No recipe to serve %q", artifact)
+	}
+
+	var sourcesLock sync.Mutex
+	sources := make([]string, 0)
+
+	var group errgroup.Group
+	for _, command := range recipe {
+		include, ok := parseCommand(command).(*includeCommand)
+		if !ok {
+			continue
+		}
+
+		for _, artifact := range include.artifacts {
+			artifact := artifact
+			group.Go(func() error {
+				buildResult, err := build(artifact)
+				if err != nil {
+					return err
+				}
+
+				sourcesLock.Lock()
+				defer sourcesLock.Unlock()
+				sources = append(sources, buildResult.sources...)
+				return nil
+			})
+		}
+	}
+
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+
+	serveDir, err := ioutil.TempDir(".build", "serve")
+	if err != nil {
+		return nil, err
+	}
+
+	for _, command := range recipe[:len(recipe)-1] {
+		if err := parseCommand(command).(runCommand).run(serveDir); err != nil {
+			return nil, err
+		}
+	}
+
+	lastCommand := parseCommand(recipe[len(recipe)-1]).(serveCommand)
+
+	return lastCommand.serve(serveDir, sources)
 }
 
 type buildResult struct {
@@ -195,7 +310,7 @@ func build(artifact string) (*buildResult, error) {
 		defer os.RemoveAll(buildDir)
 
 		for _, command := range recipe {
-			if err := parseCommand(command).run(buildDir); err != nil {
+			if err := parseCommand(command).(runCommand).run(buildDir); err != nil {
 				return nil, err
 			}
 		}
@@ -260,53 +375,103 @@ func main() {
 		panic(err)
 	}
 
-	sources := make([]string, 0)
-
+	var group errgroup.Group
 	for _, artifact := range artifacts {
-		buildResult, err := build(artifact)
-		if err != nil {
-			panic(err)
-		}
+		group.Go(func() error {
+			if strings.HasPrefix(artifact, "serve-") {
+				server, err := serve(artifact)
+				if err != nil {
+					return err
+				}
 
-		sources = append(sources, buildResult.sources...)
-	}
+				watcher, err := fsnotify.NewWatcher()
+				if err != nil {
+					panic(err)
+				}
+				defer watcher.Close()
 
-	if watching {
-		watcher, err := fsnotify.NewWatcher()
-		if err != nil {
-			panic(err)
-		}
-		defer watcher.Close()
+				if err := watcher.Add("build.yml"); err != nil {
+					panic(err)
+				}
 
-		for _, source := range sources {
-			if err := watcher.Add(source); err != nil {
-				panic(err)
-			}
-		}
-
-		for {
-			log.Printf("Watching for changes...")
-			select {
-			case event := <-watcher.Events:
-				if event.Op&fsnotify.Rename != 0 {
-					if err := watcher.Add(event.Name); err != nil {
+				for _, source := range server.listSources() {
+					if err := watcher.Add(source); err != nil {
 						panic(err)
 					}
 				}
 
-				if event.Op&(fsnotify.Write|fsnotify.Rename) != 0 {
-					log.Printf("%q changed, rebuilding...", event.Name)
+				for {
+					select {
+					case <-watcher.Events:
+						for _, source := range server.listSources() {
+							watcher.Remove(source)
+						}
 
-					for _, artifact := range artifacts {
-						_, err := build(artifact)
+						server.kill()
+
+						server, err = serve(artifact)
 						if err != nil {
 							panic(err)
 						}
+
+						for _, source := range server.listSources() {
+							if err := watcher.Add(source); err != nil {
+								panic(err)
+							}
+						}
 					}
 				}
-			case err := <-watcher.Errors:
-				log.Printf("watcher: %s", err)
+			} else {
+				buildResult, err := build(artifact)
+				if err != nil {
+					return err
+				}
+
+				if watching {
+					watcher, err := fsnotify.NewWatcher()
+					if err != nil {
+						panic(err)
+					}
+					defer watcher.Close()
+
+					if err := watcher.Add("build.yml"); err != nil {
+						panic(err)
+					}
+
+					for _, source := range buildResult.sources {
+						if err := watcher.Add(source); err != nil {
+							panic(err)
+						}
+					}
+
+					for {
+						select {
+						case <-watcher.Events:
+							for _, source := range buildResult.sources {
+								watcher.Remove(source)
+							}
+
+							log.Printf("Rebuilding...")
+							buildResult, err = build(artifact)
+							if err != nil {
+								panic(err)
+							}
+							log.Printf("Done")
+
+							for _, source := range buildResult.sources {
+								if err := watcher.Add(source); err != nil {
+									panic(err)
+								}
+							}
+						}
+					}
+				}
 			}
-		}
+
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		panic(err)
 	}
 }
