@@ -51,9 +51,9 @@ func makeArtifactKey(artifact string) string {
 	humanTag := strings.Map(func(r rune) rune {
 		if '0' <= r && r <= '9' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || r == '.' || r == '_' || r == '-' {
 			return r
-		} else {
-			return '-'
 		}
+
+		return '-'
 	}, artifact)
 	return fmt.Sprintf("%s-%x", humanTag, hash[:8])
 }
@@ -78,9 +78,8 @@ func (c *includeCommand) run(e commandEnvironment) error {
 	into := os.Expand(c.into, func(name string) string {
 		if name == "OUT" {
 			return absOutputPath
-		} else {
-			return "$" + name
 		}
+		return "$" + name
 	})
 
 	for _, artifact := range c.artifacts {
@@ -125,11 +124,7 @@ func (c *execCommand) run(e commandEnvironment) error {
 	cmd.Dir = e.buildDir
 	cmd.Env = append(cmd.Env, os.Environ()...)
 	cmd.Env = append(cmd.Env, "OUT="+absOutputPath)
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-
-	return nil
+	return cmd.Run()
 }
 
 func (c *execCommand) runServer(dir string) (*server, error) {
@@ -171,10 +166,10 @@ func interpretCommand(command string) command {
 		}
 
 		return &cmd
-	} else {
-		return &execCommand{
-			command: command,
-		}
+	}
+
+	return &execCommand{
+		command: command,
 	}
 }
 
@@ -190,14 +185,9 @@ type server struct {
 	cmd          *exec.Cmd
 }
 
-func (s *server) kill() error {
+func (s *server) kill() {
 	syscall.Kill(-s.cmd.Process.Pid, syscall.SIGINT)
-
-	if err := os.RemoveAll(s.dir); err != nil {
-		return err
-	}
-
-	return nil
+	os.RemoveAll(s.dir)
 }
 
 func serveTarget(artifact string) (*server, error) {
@@ -275,7 +265,7 @@ func serveTarget(artifact string) (*server, error) {
 
 func build(artifact string) (*buildResult, error) {
 	if strings.HasPrefix(artifact, "serve-") {
-		return nil, fmt.Errorf("Cannot build %q as an artifact")
+		return nil, fmt.Errorf("Cannot build %q as an artifact", artifact)
 	}
 
 	result, err, _ := flightGroup.Do(artifact, func() (interface{}, error) {
@@ -399,29 +389,29 @@ func build(artifact string) (*buildResult, error) {
 
 	if result == nil {
 		return nil, err
-	} else {
-		return result.(*buildResult), err
 	}
+
+	return result.(*buildResult), err
 }
 
 func buildTarget(artifact string) (interface{}, error) {
 	if strings.HasPrefix(artifact, "serve-") {
 		return serveTarget(artifact)
-	} else {
-		result, err := build(artifact)
-		if err != nil {
-			return nil, err
-		}
-		if err := os.Remove(artifact); err != nil && !os.IsNotExist(err) {
-			return nil, err
-		}
-
-		if err := os.Symlink(result.artifactPath, artifact); err != nil {
-			return nil, err
-		}
-
-		return result, nil
 	}
+
+	result, err := build(artifact)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Remove(artifact); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	if err := os.Symlink(result.artifactPath, artifact); err != nil {
+		return nil, err
+	}
+
+	return result, nil
 }
 
 func main() {
@@ -514,9 +504,7 @@ func main() {
 					log.Printf("%q changed, rebuilding...", event.Name)
 					for _, server := range servers {
 						log.Printf("Killing server %d...", server.cmd.Process.Pid)
-						if err := server.kill(); err != nil {
-							panic(err)
-						}
+						server.kill()
 					}
 
 					servers = servers[:0]
