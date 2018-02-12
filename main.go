@@ -3,10 +3,12 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/fsnotify/fsnotify"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 	"gopkg.in/yaml.v2"
 	"io/ioutil"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -205,6 +207,8 @@ func build(artifact string) (*buildResult, error) {
 }
 
 func main() {
+	var watching bool
+	flag.BoolVar(&watching, "watch", false, "Automatically rebuild files when dependencies change")
 	flag.Parse()
 
 	configBytes, err := ioutil.ReadFile("build.yml")
@@ -235,10 +239,53 @@ func main() {
 		panic(err)
 	}
 
+	sources := make([]string, 0)
+
 	for _, artifact := range artifacts {
-		_, err := build(artifact)
+		buildResult, err := build(artifact)
 		if err != nil {
 			panic(err)
+		}
+
+		sources = append(sources, buildResult.sources...)
+	}
+
+	if watching {
+		watcher, err := fsnotify.NewWatcher()
+		if err != nil {
+			panic(err)
+		}
+		defer watcher.Close()
+
+		for _, source := range sources {
+			if err := watcher.Add(source); err != nil {
+				panic(err)
+			}
+		}
+
+		for {
+			log.Printf("Watching for changes...")
+			select {
+			case event := <-watcher.Events:
+				if event.Op&fsnotify.Rename != 0 {
+					if err := watcher.Add(event.Name); err != nil {
+						panic(err)
+					}
+				}
+
+				if event.Op&(fsnotify.Write|fsnotify.Rename) != 0 {
+					log.Printf("%q changed, rebuilding...", event.Name)
+
+					for _, artifact := range artifacts {
+						_, err := build(artifact)
+						if err != nil {
+							panic(err)
+						}
+					}
+				}
+			case err := <-watcher.Errors:
+				log.Printf("watcher: %s", err)
+			}
 		}
 	}
 }
