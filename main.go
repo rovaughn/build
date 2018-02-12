@@ -190,6 +190,7 @@ func build(artifact string) (*buildResult, error) {
 					cmd.Stdout = os.Stderr
 					cmd.Stderr = os.Stderr
 					cmd.Dir = buildDir
+					cmd.Env = append(cmd.Env, os.Environ()...)
 					cmd.Env = append(cmd.Env, "OUT="+absOutputPath)
 					if err := cmd.Run(); err != nil {
 						return nil, err
@@ -197,6 +198,10 @@ func build(artifact string) (*buildResult, error) {
 				default:
 					panic("impossible")
 				}
+			}
+
+			if err := os.RemoveAll(artifactPath); err != nil && !os.IsNotExist(err) {
+				return nil, err
 			}
 
 			if err := os.Rename(outputPath, artifactPath); err != nil {
@@ -248,6 +253,10 @@ func main() {
 	}
 
 	for _, artifact := range flag.Args() {
+		if _, ok := config[artifact]; !ok {
+			panic(fmt.Sprintf("%q isn't a recipe", artifact))
+		}
+
 		buildResult, err := build(artifact)
 		if err != nil {
 			panic(err)
