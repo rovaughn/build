@@ -20,6 +20,7 @@ focuses on correcting the following deficiencies I have run into with make:
   dependencies change.
 - No support for running long running processes from artifacts, e.g. an HTTP
   server, that automatically restarts when dependencies change.
+- Make isn't very good at producing a directory as a target.
 
 Here is what an example build configuration looks like, stored in a file called
 `build.yml`:
@@ -91,6 +92,8 @@ Here are some examples of what the command line could look like:
 
 ## TODO ##
 
+- When depending on a directory, consider the modtimes of all files in the
+  directory.
 - Automatic recipes based on file extension.  For instance a recipe named
   something like `default.c` would run for any `.c` file that didn't have an
   explicit recipe.
