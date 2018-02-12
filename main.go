@@ -2,32 +2,34 @@ package main
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
 	"flag"
 	"fmt"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
+	"sync"
+	"time"
 )
 
+var flightGroup singleflight.Group
 var config map[string][]string
 
-var originalDir = func() string {
-	result, err := os.Getwd()
-	if err != nil {
-		panic(err)
-	}
-	return result
-}()
-
-func tokenize(text string) string {
-	hash := sha256.Sum256([]byte(text))
-	return hex.EncodeToString(hash[:8])
+func makeArtifactKey(artifact string) string {
+	hash := sha256.Sum256([]byte(artifact))
+	humanTag := strings.Map(func(r rune) rune {
+		if '0' <= r && r <= '9' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || r == '.' || r == '_' || r == '-' {
+			return r
+		} else {
+			return '-'
+		}
+	}, artifact)
+	return fmt.Sprintf("%s-%x", humanTag, hash[:8])
 }
 
 type includeCommand struct {
@@ -65,127 +67,174 @@ func interpretCommand(command string) interface{} {
 	}
 }
 
-func build(target string) string {
-	log.Printf("build %q", target)
+type buildResult struct {
+	artifactPath string
+	modTime      time.Time
+}
 
-	commands, recipeExists := config[target]
+func build(artifact string) (*buildResult, error) {
+	result, err, _ := flightGroup.Do(artifact, func() (interface{}, error) {
+		artifactKey := makeArtifactKey(artifact)
 
-	if !recipeExists {
-		// If the artifact is present in our source dir, we just include it.
-		if stat, err := os.Stat(filepath.Join(originalDir, target)); err == nil {
-			artifactKey := tokenize(fmt.Sprintf("%#v%#v", target, stat.ModTime().Unix()))
-			artifactPath := filepath.Join(originalDir, ".build", "artifact-"+artifactKey)
+		recipe, ok := config[artifact]
+		if ok {
+			var lastBuildTime time.Time
+			var needsBuild bool
 
-			log.Printf("%s -> %s", target, artifactKey)
+			artifactPath := filepath.Join(".build", "artifact-"+artifactKey)
 
-			if err := os.Symlink(filepath.Join(originalDir, target), artifactPath); err != nil && !os.IsExist(err) {
-				panic(err)
+			if stat, err := os.Stat(artifactPath); err == nil {
+				lastBuildTime = stat.ModTime()
+			} else if os.IsNotExist(err) {
+				needsBuild = true
+			} else {
+				return nil, err
 			}
 
-			return artifactPath
-		} else if !os.IsNotExist(err) {
-			panic(err)
-		} else {
-			panic(fmt.Sprintf("Don't know how to build %q", target))
-		}
-	}
+			var dependenciesLock sync.Mutex
+			dependencies := make(map[string]string)
 
-	dependencies := make(map[string]string)
-	orderedDependencies := make([]string, 0)
-	keyMaterial := make([]string, 0)
-
-	for _, command := range commands {
-		keyMaterial = append(keyMaterial, command)
-		switch cmd := interpretCommand(command).(type) {
-		case *execCommand:
-		case *includeCommand:
-			for _, artifact := range cmd.artifacts {
-				dependencies[artifact] = build(artifact)
-				orderedDependencies = append(orderedDependencies, artifact)
-			}
-		default:
-			panic("bad command")
-		}
-	}
-
-	sort.Strings(orderedDependencies)
-
-	for _, artifact := range orderedDependencies {
-		keyMaterial = append(keyMaterial, artifact, dependencies[artifact])
-	}
-
-	artifactKey := tokenize(strings.Join(keyMaterial, strings.Join(keyMaterial, "")))
-	artifactPath := filepath.Join(originalDir, ".build", "artifact-"+artifactKey)
-
-	if _, err := os.Stat(artifactPath); err == nil {
-		return artifactPath
-	} else if !os.IsNotExist(err) {
-		panic(err)
-	}
-
-	outputPath := filepath.Join(originalDir, ".build", "artifact-output-"+artifactKey)
-	defer os.RemoveAll(outputPath)
-
-	buildDir := filepath.Join(originalDir, ".build", "build-"+artifactKey)
-	if err := os.Mkdir(buildDir, 0700); err != nil {
-		panic(err)
-	}
-	defer os.RemoveAll(buildDir)
-
-	for _, commandString := range commands {
-		switch command := interpretCommand(commandString).(type) {
-		case *includeCommand:
-			command.into = os.Expand(command.into, func(name string) string {
-				if name == "OUT" {
-					return outputPath
-				} else {
-					panic("Unknown variable " + name)
-				}
-			})
-
-			for _, artifact := range command.artifacts {
-				artifactPath, ok := dependencies[artifact]
+			for _, command := range recipe {
+				include, ok := interpretCommand(command).(*includeCommand)
 				if !ok {
-					panic("artifact not built somehow")
+					continue
 				}
 
-				var intoPath string
-				if filepath.IsAbs(command.into) {
-					intoPath = filepath.Join(command.into, artifact)
-				} else {
-					intoPath = filepath.Join(buildDir, artifact)
-				}
+				var group errgroup.Group
+				for _, artifact := range include.artifacts {
+					artifact := artifact
+					group.Go(func() error {
+						buildResult, err := build(artifact)
+						if err != nil {
+							return err
+						}
 
-				if err := os.Symlink(artifactPath, intoPath); err != nil {
-					panic(err)
+						if buildResult.modTime.After(lastBuildTime) {
+							needsBuild = true
+						}
+
+						dependenciesLock.Lock()
+						defer dependenciesLock.Unlock()
+						dependencies[artifact] = buildResult.artifactPath
+
+						return nil
+					})
+				}
+				if err := group.Wait(); err != nil {
+					return nil, err
 				}
 			}
-		case *execCommand:
-			log.Printf("Executing %q", command.command)
-			cmd := exec.Command("sh", "-c", command.command)
-			cmd.Stdout = os.Stderr
-			cmd.Stderr = os.Stderr
-			cmd.Dir = buildDir
-			cmd.Env = append(cmd.Env, "OUT="+outputPath)
-			if err := cmd.Run(); err != nil {
-				panic(err)
+
+			if !needsBuild {
+				return &buildResult{
+					artifactPath: artifactPath,
+					modTime:      lastBuildTime,
+				}, nil
 			}
-		default:
-			panic("bad command")
+
+			buildDir := filepath.Join(".build", "build-"+artifactKey)
+			if err := os.Mkdir(buildDir, 0700); err != nil {
+				return nil, err
+			}
+			defer os.RemoveAll(buildDir)
+
+			outputPath := filepath.Join(".build", "artifact-output-"+artifactKey)
+			defer os.RemoveAll(outputPath)
+
+			absOutputPath, err := filepath.Abs(outputPath)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, command := range recipe {
+				log.Printf("Executing %q", command)
+				switch command := interpretCommand(command).(type) {
+				case *includeCommand:
+					command.into = os.Expand(command.into, func(name string) string {
+						if name == "OUT" {
+							return absOutputPath
+						} else {
+							return "$" + name
+						}
+					})
+
+					for _, artifact := range command.artifacts {
+						dependencyPath, ok := dependencies[artifact]
+						if !ok {
+							panic("impossible")
+						}
+
+						var intoPath string
+						if filepath.IsAbs(command.into) {
+							intoPath = filepath.Join(command.into, artifact)
+						} else {
+							intoPath = filepath.Join(buildDir, command.into, artifact)
+						}
+
+						absDependecyPath, err := filepath.Abs(dependencyPath)
+						if err != nil {
+							return nil, err
+						}
+
+						if err := os.Symlink(absDependecyPath, intoPath); err != nil {
+							return nil, err
+						}
+					}
+				case *execCommand:
+					absOutputPath, err := filepath.Abs(outputPath)
+					if err != nil {
+						return nil, err
+					}
+
+					cmd := exec.Command("sh", "-c", command.command)
+					cmd.Stdout = os.Stderr
+					cmd.Stderr = os.Stderr
+					cmd.Dir = buildDir
+					cmd.Env = append(cmd.Env, "OUT="+absOutputPath)
+					if err := cmd.Run(); err != nil {
+						return nil, err
+					}
+				default:
+					panic("impossible")
+				}
+			}
+
+			if err := os.Rename(outputPath, artifactPath); err != nil {
+				return nil, err
+			}
+
+			now := time.Now()
+			if err := os.Chtimes(artifactPath, now, now); err != nil {
+				return nil, err
+			}
+
+			return &buildResult{
+				artifactPath: artifactPath,
+				modTime:      now,
+			}, nil
 		}
-	}
 
-	if err := os.Rename(outputPath, artifactPath); err != nil {
-		panic(err)
-	}
+		if stat, err := os.Stat(artifact); err == nil {
+			return &buildResult{
+				artifactPath: artifact,
+				modTime:      stat.ModTime(),
+			}, nil
+		}
 
-	return artifactPath
+		return nil, fmt.Errorf("Don't know how to build %q", artifact)
+	})
+
+	if err != nil {
+		return nil, err
+	} else {
+		return result.(*buildResult), nil
+	}
 }
 
 func main() {
 	flag.Parse()
 
-	if err := os.MkdirAll(filepath.Join(originalDir, ".build"), 0700); err != nil {
+	if err := os.Mkdir(".build", 0700); err != nil && !os.IsExist(err) {
 		panic(err)
 	}
 
@@ -199,14 +248,16 @@ func main() {
 	}
 
 	for _, artifact := range flag.Args() {
-		artifactPath := build(artifact)
-		log.Printf("%s -> %s", artifact, artifactPath)
+		buildResult, err := build(artifact)
+		if err != nil {
+			panic(err)
+		}
 
 		if err := os.Remove(artifact); err != nil && !os.IsNotExist(err) {
 			panic(err)
 		}
 
-		if err := os.Symlink(artifactPath, artifact); err != nil {
+		if err := os.Symlink(buildResult.artifactPath, artifact); err != nil {
 			panic(err)
 		}
 	}
