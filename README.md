@@ -114,3 +114,5 @@ If you have go installed, you should just be able to do
   compiles something, it can tell you exactly what source files it ended up
   using.  You could refine an include so it actually only depends on the files
   that were actually used.
+- ptrace could be used to do things like automatically determine dependencies,
+  and truly constrain a recipe to its build directory.
