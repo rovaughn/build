@@ -89,7 +89,7 @@ type execServer struct {
 }
 
 func (c *execCommand) run(dir string) error {
-	log.Println("run", c.command)
+	log.Printf("%s", c.command)
 	cmd := exec.Command("sh", "-c", c.command)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
@@ -352,6 +352,7 @@ func build(artifact string) (*buildResult, error) {
 			return nil, err
 		}
 
+		log.Printf("Renaming %s to %s", filepath.Join(buildDir, filepath.Base(artifact)), artifact)
 		if err := os.Rename(filepath.Join(buildDir, filepath.Base(artifact)), artifact); err != nil {
 			return nil, err
 		}
@@ -384,6 +385,10 @@ func main() {
 	}
 
 	if flag.Arg(0) == "clean" {
+		if err := os.RemoveAll(".build"); err != nil {
+			panic(err)
+		}
+
 		for artifact := range recipes {
 			if err := os.RemoveAll(artifact); err != nil {
 				panic(err)
@@ -402,14 +407,16 @@ func main() {
 		panic(err)
 	}
 
-	var group errgroup.Group
+	var group sync.WaitGroup
 	for _, artifact := range artifacts {
 		artifact := artifact
-		group.Go(func() error {
+		group.Add(1)
+		go func() {
+			defer group.Done()
 			if strings.HasPrefix(artifact, "serve-") {
 				server, err := serve(artifact)
 				if err != nil {
-					return err
+					panic(err)
 				}
 
 				watcher, err := fsnotify.NewWatcher()
@@ -431,20 +438,22 @@ func main() {
 				for {
 					select {
 					case <-watcher.Events:
-						for _, source := range server.listSources() {
-							watcher.Remove(source)
-						}
-
 						server.kill()
 
 						server, err = serve(artifact)
 						if err != nil {
-							panic(err)
+							log.Printf("%s failed: %s", artifact, err)
 						}
 
-						for _, source := range server.listSources() {
-							if err := watcher.Add(source); err != nil {
-								panic(err)
+						if server != nil {
+							for _, source := range server.listSources() {
+								watcher.Remove(source)
+							}
+
+							for _, source := range server.listSources() {
+								if err := watcher.Add(source); err != nil {
+									panic(err)
+								}
 							}
 						}
 					}
@@ -452,7 +461,7 @@ func main() {
 			} else {
 				buildResult, err := build(artifact)
 				if err != nil {
-					return err
+					panic(err)
 				}
 
 				if watching {
@@ -479,12 +488,12 @@ func main() {
 								watcher.Remove(source)
 							}
 
-							log.Printf("Rebuilding...")
+							log.Printf("%s: rebuilding...", artifact)
 							buildResult, err = build(artifact)
 							if err != nil {
 								panic(err)
 							}
-							log.Printf("Done")
+							log.Printf("%s: built", artifact)
 
 							for _, source := range buildResult.sources {
 								if err := watcher.Add(source); err != nil {
@@ -495,11 +504,8 @@ func main() {
 					}
 				}
 			}
+		}()
+	}
 
-			return nil
-		})
-	}
-	if err := group.Wait(); err != nil {
-		panic(err)
-	}
+	group.Wait()
 }
