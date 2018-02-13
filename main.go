@@ -13,10 +13,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -99,15 +101,14 @@ func (c *execCommand) run(dir string) error {
 
 func (c *execCommand) serve(dir string, sources []string) (server, error) {
 	cmd := exec.Command("sh", "-c", c.command)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	cmd.Dir = dir
 
-	go func() {
-		if err := cmd.Run(); err != nil {
-			log.Println(err)
-		}
-	}()
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
 
 	return &execServer{
 		cmd:     cmd,
@@ -121,6 +122,14 @@ func (s *execServer) listSources() []string {
 }
 
 func (s *execServer) kill() {
+	if err := syscall.Kill(-s.cmd.Process.Pid, syscall.SIGINT); err != nil {
+		log.Print(err)
+	}
+
+	if err := s.cmd.Wait(); err != nil {
+		log.Print(err)
+	}
+	log.Printf("Killed")
 }
 
 type serveHTTPCommand struct {
@@ -435,8 +444,14 @@ func main() {
 					}
 				}
 
+				interruptChan := make(chan os.Signal)
+				signal.Notify(interruptChan, os.Interrupt)
+
 				for {
 					select {
+					case <-interruptChan:
+						server.kill()
+						return
 					case <-watcher.Events:
 						server.kill()
 
@@ -481,8 +496,13 @@ func main() {
 						}
 					}
 
+					interruptChan := make(chan os.Signal)
+					signal.Notify(interruptChan, os.Interrupt)
+
 					for {
 						select {
+						case <-interruptChan:
+							return
 						case <-watcher.Events:
 							for _, source := range buildResult.sources {
 								watcher.Remove(source)
