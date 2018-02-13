@@ -71,7 +71,7 @@ func (c *includeCommand) run(dir string) error {
 				return err
 			}
 		} else {
-			if err := os.Symlink(artifactPath, filepath.Join(dir, c.into, artifact)); err != nil {
+			if err := os.Symlink(artifactPath, filepath.Join(dir, c.into, filepath.Base(artifact))); err != nil {
 				return err
 			}
 		}
