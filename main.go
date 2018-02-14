@@ -440,10 +440,16 @@ func main() {
 		go func() {
 			defer group.Done()
 			if strings.HasPrefix(artifact, "serve-") {
+				log.Printf("Starting up server for %s", artifact)
 				server, err := serve(artifact)
 				if err != nil {
 					panic(err)
 				}
+				defer func() {
+					if server != nil {
+						server.kill()
+					}
+				}()
 
 				watcher, err := fsnotify.NewWatcher()
 				if err != nil {
@@ -461,20 +467,20 @@ func main() {
 					}
 				}
 
-				interruptChan := make(chan os.Signal)
+				interruptChan := make(chan os.Signal, 1)
 				signal.Notify(interruptChan, os.Interrupt)
 
 				for {
 					select {
 					case e := <-server.wait():
 						log.Printf("Server unexpectedly died: %s", e)
-						log.Printf("Restarting server in a second...")
-						time.Sleep(1)
+						time.Sleep(time.Second)
 						if server != nil {
 							for _, source := range server.listSources() {
 								watcher.Remove(source)
 							}
 						}
+						log.Printf("Starting up server for %s", artifact)
 						server, err = serve(artifact)
 						if err != nil {
 							log.Printf("%s failed: %s", artifact, err)
@@ -498,9 +504,11 @@ func main() {
 							}
 						}
 
+						log.Printf("Starting up server for %s", artifact)
 						server, err = serve(artifact)
 						if err != nil {
 							log.Printf("%s failed: %s", artifact, err)
+							time.Sleep(time.Second)
 						}
 
 						if server != nil {
@@ -535,7 +543,7 @@ func main() {
 						}
 					}
 
-					interruptChan := make(chan os.Signal)
+					interruptChan := make(chan os.Signal, 1)
 					signal.Notify(interruptChan, os.Interrupt)
 
 					for {
