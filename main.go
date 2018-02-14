@@ -29,8 +29,9 @@ type command interface {
 }
 
 type server interface {
-	listSources() []string
 	kill()
+	listSources() []string
+	wait() chan error
 }
 
 type serveCommand interface {
@@ -85,9 +86,10 @@ type execCommand struct {
 }
 
 type execServer struct {
-	cmd     *exec.Cmd
-	dir     string
-	sources []string
+	cmd      *exec.Cmd
+	dir      string
+	sources  []string
+	waitChan chan error
 }
 
 func (c *execCommand) run(dir string) error {
@@ -110,10 +112,16 @@ func (c *execCommand) serve(dir string, sources []string) (server, error) {
 		return nil, err
 	}
 
+	waitChan := make(chan error)
+	go func() {
+		waitChan <- cmd.Wait()
+	}()
+
 	return &execServer{
-		cmd:     cmd,
-		dir:     dir,
-		sources: sources,
+		cmd:      cmd,
+		dir:      dir,
+		sources:  sources,
+		waitChan: waitChan,
 	}, nil
 }
 
@@ -130,6 +138,10 @@ func (s *execServer) kill() {
 		log.Print(err)
 	}
 	log.Printf("Killed")
+}
+
+func (s *execServer) wait() chan error {
+	return s.waitChan
 }
 
 type serveHTTPCommand struct {
@@ -150,6 +162,11 @@ func (s *httpServer) listSources() []string {
 func (s *httpServer) kill() {
 	os.RemoveAll(s.dir)
 	s.server.Close()
+}
+
+func (s *httpServer) wait() chan error {
+	// HTTP server should never die unexpectedly
+	return nil
 }
 
 func (c *serveHTTPCommand) serve(dir string, sources []string) (server, error) {
@@ -449,11 +466,37 @@ func main() {
 
 				for {
 					select {
+					case e := <-server.wait():
+						log.Printf("Server unexpectedly died: %s", e)
+						log.Printf("Restarting server in a second...")
+						time.Sleep(1)
+						if server != nil {
+							for _, source := range server.listSources() {
+								watcher.Remove(source)
+							}
+						}
+						server, err = serve(artifact)
+						if err != nil {
+							log.Printf("%s failed: %s", artifact, err)
+						}
+						if server != nil {
+							for _, source := range server.listSources() {
+								if err := watcher.Add(source); err != nil {
+									panic(err)
+								}
+							}
+						}
 					case <-interruptChan:
 						server.kill()
 						return
 					case <-watcher.Events:
 						server.kill()
+
+						if server != nil {
+							for _, source := range server.listSources() {
+								watcher.Remove(source)
+							}
+						}
 
 						server, err = serve(artifact)
 						if err != nil {
@@ -461,10 +504,6 @@ func main() {
 						}
 
 						if server != nil {
-							for _, source := range server.listSources() {
-								watcher.Remove(source)
-							}
-
 							for _, source := range server.listSources() {
 								if err := watcher.Add(source); err != nil {
 									panic(err)
