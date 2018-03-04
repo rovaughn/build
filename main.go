@@ -72,8 +72,11 @@ func (c *includeCommand) run(dir string) error {
 				return err
 			}
 		} else {
-			if err := os.Symlink(artifactPath, filepath.Join(dir, c.into, filepath.Base(artifact))); err != nil {
-				return err
+			destPath := filepath.Join(dir, c.into, filepath.Base(artifact))
+			cmd := exec.Command("doas", "-u", "builder", "ln", "-s", artifactPath, destPath)
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("Linking artifact %q to %q: %s", artifactPath, destPath, err)
 			}
 		}
 	}
@@ -94,11 +97,20 @@ type execServer struct {
 
 func (c *execCommand) run(dir string) error {
 	log.Printf("%s", c.command)
-	cmd := exec.Command("sh", "-c", c.command)
+	cmd := exec.Command(
+		"doas", "-u", "builder",
+		"sh", "-c", fmt.Sprintf("cd %s; %s", dir, c.command),
+	)
+	env := os.Environ()
+	cmd.Env = make([]string, 0, len(env)+1)
+	cmd.Env = append(cmd.Env, env...)
+	cmd.Env = append(cmd.Env, "WORKDIR="+dir)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
-	cmd.Dir = dir
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("Running %q: %s", c.command, err)
+	}
+	return nil
 }
 
 func (c *execCommand) serve(dir string, sources []string) (server, error) {
@@ -270,7 +282,7 @@ func serve(artifact string) (server, error) {
 		return nil, err
 	}
 
-	serveDir, err := ioutil.TempDir(".build", "serve")
+	serveDir, err := ioutil.TempDir("", "serve")
 	if err != nil {
 		return nil, err
 	}
@@ -362,11 +374,25 @@ func build(artifact string) (*buildResult, error) {
 			}, nil
 		}
 
-		buildDir, err := ioutil.TempDir(".build", "build")
+		cmd := exec.Command("doas", "-u", "builder", "mktemp", "-d")
+		cmd.Stderr = os.Stderr
+		buildDirBytes, err := cmd.Output()
 		if err != nil {
 			return nil, err
 		}
-		defer os.RemoveAll(buildDir)
+
+		buildDir := strings.TrimSpace(string(buildDirBytes))
+		log.Printf("temp dir is %q", buildDir)
+
+		if err := exec.Command("doas", "-u", "builder", "chmod", "g+rx", buildDir).Run(); err != nil {
+			return nil, err
+		}
+
+		defer func() {
+			if err := exec.Command("doas", "-u", "builder", "rm", "-rf", buildDir).Run(); err != nil {
+				log.Printf("Deleting build dir %q: %s", err)
+			}
+		}()
 
 		for _, command := range recipe {
 			if err := parseCommand(command).(runCommand).run(buildDir); err != nil {
@@ -378,9 +404,13 @@ func build(artifact string) (*buildResult, error) {
 			return nil, err
 		}
 
-		log.Printf("Renaming %s to %s", filepath.Join(buildDir, filepath.Base(artifact)), artifact)
-		if err := os.Rename(filepath.Join(buildDir, filepath.Base(artifact)), artifact); err != nil {
-			return nil, err
+		sourcePath := filepath.Join(buildDir, filepath.Base(artifact))
+		if err := exec.Command(
+			"cp", "-r",
+			sourcePath,
+			artifact,
+		).Run(); err != nil {
+			return nil, fmt.Errorf("Copying %q to %q: %s", sourcePath, artifact, err)
 		}
 
 		return &buildResult{
@@ -471,34 +501,26 @@ func main() {
 				signal.Notify(interruptChan, os.Interrupt)
 
 				for {
+					var waitChan chan error
+					if server != nil {
+						waitChan = server.wait()
+					}
+
 					select {
-					case e := <-server.wait():
+					case e := <-waitChan:
 						log.Printf("Server unexpectedly died: %s", e)
-						time.Sleep(time.Second)
 						if server != nil {
 							for _, source := range server.listSources() {
 								watcher.Remove(source)
-							}
-						}
-						log.Printf("Starting up server for %s", artifact)
-						server, err = serve(artifact)
-						if err != nil {
-							log.Printf("%s failed: %s", artifact, err)
-						}
-						if server != nil {
-							for _, source := range server.listSources() {
-								if err := watcher.Add(source); err != nil {
-									panic(err)
-								}
 							}
 						}
 					case <-interruptChan:
 						server.kill()
 						return
 					case <-watcher.Events:
-						server.kill()
-
 						if server != nil {
+							server.kill()
+
 							for _, source := range server.listSources() {
 								watcher.Remove(source)
 							}
@@ -508,7 +530,6 @@ func main() {
 						server, err = serve(artifact)
 						if err != nil {
 							log.Printf("%s failed: %s", artifact, err)
-							time.Sleep(time.Second)
 						}
 
 						if server != nil {
