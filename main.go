@@ -404,13 +404,23 @@ func build(artifact string) (*buildResult, error) {
 			return nil, err
 		}
 
+		copyDir, err := ioutil.TempDir(".", "build")
+		if err != nil {
+			return nil, err
+		}
+		defer os.RemoveAll(copyDir)
+
 		sourcePath := filepath.Join(buildDir, filepath.Base(artifact))
 		if err := exec.Command(
 			"cp", "-r",
 			sourcePath,
-			artifact,
+			filepath.Join(copyDir, "artifact"),
 		).Run(); err != nil {
 			return nil, fmt.Errorf("Copying %q to %q: %s", sourcePath, artifact, err)
+		}
+
+		if err := os.Rename(filepath.Join(copyDir, "artifact"), artifact); err != nil {
+			return nil, err
 		}
 
 		return &buildResult{
